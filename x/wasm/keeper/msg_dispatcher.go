@@ -17,7 +17,36 @@ import (
 // Messenger is an extension point for custom wasmd message handling
 type Messenger interface {
 	// DispatchMsg encodes the wasmVM message and dispatches it.
-	DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err error)
+	DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err SourcedError)
+}
+
+type SourcedError interface {
+	Source() Source
+	Error() string
+}
+
+type Source int
+
+const (
+	contract = iota
+	other
+)
+
+type DispatchError struct {
+	source Source
+	err error
+}
+
+func (d DispatchError) Source() Source {
+	return d.source
+}
+
+func (d DispatchError) Error() string {
+	return d.err.Error()
+}
+
+func newDispatchError(err error, src Source) HandlerError {
+	return HandlerError {Err: err, Src: src}
 }
 
 // replyer is a subset of keeper that can handle replies to submessages
@@ -50,7 +79,7 @@ func (d MessageDispatcher) DispatchMessages(ctx sdk.Context, contractAddr sdk.Ac
 }
 
 // dispatchMsgWithGasLimit sends a message with gas limit applied
-func (d MessageDispatcher) dispatchMsgWithGasLimit(ctx sdk.Context, contractAddr sdk.AccAddress, ibcPort string, msg wasmvmtypes.CosmosMsg, gasLimit uint64) (events []sdk.Event, data [][]byte, err error) {
+func (d MessageDispatcher) dispatchMsgWithGasLimit(ctx sdk.Context, contractAddr sdk.AccAddress, ibcPort string, msg wasmvmtypes.CosmosMsg, gasLimit uint64) (events []sdk.Event, data [][]byte, err SourcedError) {
 	limitedMeter := sdk.NewGasMeter(gasLimit)
 	subCtx := ctx.WithGasMeter(limitedMeter)
 
@@ -64,7 +93,7 @@ func (d MessageDispatcher) dispatchMsgWithGasLimit(ctx sdk.Context, contractAddr
 				panic(r)
 			}
 			ctx.GasMeter().ConsumeGas(gasLimit, "Sub-Message OutOfGas panic")
-			err = errorsmod.Wrap(sdkerrors.ErrOutOfGas, "SubMsg hit gas limit")
+			err = newDispatchError(errorsmod.Wrap(sdkerrors.ErrOutOfGas, "SubMsg hit gas limit"), other)
 		}
 	}()
 	events, data, err = d.messenger.DispatchMsg(subCtx, contractAddr, ibcPort, msg)
@@ -95,7 +124,7 @@ func (d MessageDispatcher) DispatchSubmessages(ctx sdk.Context, contractAddr sdk
 		gasRemaining := ctx.GasMeter().Limit() - ctx.GasMeter().GasConsumed()
 		limitGas := msg.GasLimit != nil && (*msg.GasLimit < gasRemaining)
 
-		var err error
+		var err SourcedError
 		var events []sdk.Event
 		var data [][]byte
 		if limitGas {
@@ -161,10 +190,10 @@ func (d MessageDispatcher) DispatchSubmessages(ctx sdk.Context, contractAddr sdk
 
 		// we can ignore any result returned as there is nothing to do with the data
 		// and the events are already in the ctx.EventManager()
-		rspData, err := d.keeper.reply(ctx, contractAddr, reply)
+		rspData, nerr := d.keeper.reply(ctx, contractAddr, reply)
 		switch {
 		case err != nil:
-			return nil, errorsmod.Wrap(err, "reply")
+			return nil, errorsmod.Wrap(nerr, "reply")
 		case rspData != nil:
 			rsp = rspData
 		}
@@ -173,20 +202,38 @@ func (d MessageDispatcher) DispatchSubmessages(ctx sdk.Context, contractAddr sdk
 }
 
 // Issue #759 - we don't return error string for worries of non-determinism
-func redactError(err error) error {
+func redactError(err SourcedError) error {
 	// Do not redact system errors
 	// SystemErrors must be created in x/wasm and we can ensure determinism
 	if wasmvmtypes.ToSystemError(err) != nil {
 		return err
 	}
 
-	// FIXME: do we want to hardcode some constant string mappings here as well?
-	// Or better document them? (SDK error string may change on a patch release to fix wording)
-	// sdk/11 is out of gas
-	// sdk/5 is insufficient funds (on bank send)
-	// (we can theoretically redact less in the future, but this is a first step to safety)
-	codespace, code, _ := errorsmod.ABCIInfo(err, false)
-	return fmt.Errorf("codespace: %s, code: %d", codespace, code)
+	switch err.Source() {
+		case contract: {
+			return err
+		}
+		case other: {
+			// FIXME: do we want to hardcode some constant string mappings here as well?
+			// Or better document them? (SDK error string may change on a patch release to fix wording)
+			// sdk/11 is out of gas
+			// sdk/5 is insufficient funds (on bank send)
+			// (we can theoretically redact less in the future, but this is a first step to safety)
+			codespace, code, _ := errorsmod.ABCIInfo(err, false)
+			return fmt.Errorf("codespace: %s, code: %d", codespace, code)
+		}
+		default: {
+				// FIXME: do we want to hardcode some constant string mappings here as well?
+				// Or better document them? (SDK error string may change on a patch release to fix wording)
+				// sdk/11 is out of gas
+				// sdk/5 is insufficient funds (on bank send)
+				// (we can theoretically redact less in the future, but this is a first step to safety)
+				codespace, code, _ := errorsmod.ABCIInfo(err, false)
+				return fmt.Errorf("codespace: %s, code: %d", codespace, code)
+		}
+	}
+
+
 }
 
 func filterEvents(events []sdk.Event) []sdk.Event {

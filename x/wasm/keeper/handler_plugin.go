@@ -34,6 +34,23 @@ type SDKMessageHandler struct {
 	encoders msgEncoder
 }
 
+type HandlerError struct {
+	Err error
+	Src Source
+}
+
+func (h HandlerError) Source() Source {
+	return h.Src
+}
+
+func (h HandlerError) Error() string {
+	return h.Err.Error()
+}
+
+func newHandlerError(err error, src Source) HandlerError {
+	return HandlerError {Err: err, Src: src}
+}
+
 // NewDefaultMessageHandler constructor
 func NewDefaultMessageHandler(
 	router MessageRouter,
@@ -63,16 +80,24 @@ func NewSDKMessageHandler(router MessageRouter, encoders msgEncoder) SDKMessageH
 	}
 }
 
-func (h SDKMessageHandler) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err error) {
-	sdkMsgs, err := h.encoders.Encode(ctx, contractAddr, contractIBCPortID, msg)
+func (h SDKMessageHandler) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err SourcedError) {
+	sdkMsgs, rawErr := h.encoders.Encode(ctx, contractAddr, contractIBCPortID, msg)
 	if err != nil {
-		return nil, nil, err
+		if msg.Wasm != nil {
+			return nil, nil, newHandlerError(rawErr, contract)
+		} else {
+			return nil, nil, newHandlerError(rawErr, other)
+		}
 	}
 	for _, sdkMsg := range sdkMsgs {
 		res, err := h.handleSdkMessage(ctx, contractAddr, sdkMsg)
 		if err != nil {
-			return nil, nil, err
-		}
+			// TODO can we safely assume that if msg was Wasm, any error here comes from the contract?
+			if msg.Wasm != nil {
+				return nil, nil, newHandlerError(rawErr, contract)
+			} else {
+				return nil, nil, newHandlerError(rawErr, other)
+			}		}
 		// append data
 		data = append(data, res.Data)
 		// append events
@@ -129,7 +154,7 @@ func NewMessageHandlerChain(first Messenger, others ...Messenger) *MessageHandle
 // order to find the right one to process given message. If a handler cannot
 // process given message (returns ErrUnknownMsg), its result is ignored and the
 // next handler is executed.
-func (m MessageHandlerChain) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) ([]sdk.Event, [][]byte, error) {
+func (m MessageHandlerChain) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) ([]sdk.Event, [][]byte, SourcedError) {
 	for _, h := range m.handlers {
 		events, data, err := h.DispatchMsg(ctx, contractAddr, contractIBCPortID, msg)
 		switch {
@@ -141,7 +166,7 @@ func (m MessageHandlerChain) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAd
 			return events, data, err
 		}
 	}
-	return nil, nil, errorsmod.Wrap(types.ErrUnknownMsg, "no handler found")
+	return nil, nil, newHandlerError(errorsmod.Wrap(types.ErrUnknownMsg, "no handler found"), other)
 }
 
 // IBCRawPacketHandler handles IBC.SendPacket messages which are published to an IBC channel.
@@ -161,32 +186,32 @@ func NewIBCRawPacketHandler(ics4Wrapper types.ICS4Wrapper, channelKeeper types.C
 }
 
 // DispatchMsg publishes a raw IBC packet onto the channel.
-func (h IBCRawPacketHandler) DispatchMsg(ctx sdk.Context, _ sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) ([]sdk.Event, [][]byte, error) {
+func (h IBCRawPacketHandler) DispatchMsg(ctx sdk.Context, _ sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) ([]sdk.Event, [][]byte, SourcedError) {
 	if msg.IBC == nil || msg.IBC.SendPacket == nil {
-		return nil, nil, types.ErrUnknownMsg
+		return nil, nil, newHandlerError(types.ErrUnknownMsg, other)
 	}
 	if contractIBCPortID == "" {
-		return nil, nil, errorsmod.Wrapf(types.ErrUnsupportedForContract, "ibc not supported")
+		return nil, nil, newHandlerError(errorsmod.Wrapf(types.ErrUnsupportedForContract, "ibc not supported"), other)
 	}
 	contractIBCChannelID := msg.IBC.SendPacket.ChannelID
 	if contractIBCChannelID == "" {
-		return nil, nil, errorsmod.Wrapf(types.ErrEmpty, "ibc channel")
+		return nil, nil, newHandlerError(errorsmod.Wrapf(types.ErrEmpty, "ibc channel"), other)
 	}
 
 	channelCap, ok := h.capabilityKeeper.GetCapability(ctx, host.ChannelCapabilityPath(contractIBCPortID, contractIBCChannelID))
 	if !ok {
-		return nil, nil, errorsmod.Wrap(channeltypes.ErrChannelCapabilityNotFound, "module does not own channel capability")
+		return nil, nil, newHandlerError(errorsmod.Wrap(channeltypes.ErrChannelCapabilityNotFound, "module does not own channel capability"), other)
 	}
 	seq, err := h.ics4Wrapper.SendPacket(ctx, channelCap, contractIBCPortID, contractIBCChannelID, ConvertWasmIBCTimeoutHeightToCosmosHeight(msg.IBC.SendPacket.Timeout.Block), msg.IBC.SendPacket.Timeout.Timestamp, msg.IBC.SendPacket.Data)
 	if err != nil {
-		return nil, nil, errorsmod.Wrap(err, "channel")
+		return nil, nil, newHandlerError(errorsmod.Wrap(err, "channel"), other)
 	}
 	moduleLogger(ctx).Debug("ibc packet set", "seq", seq)
 
 	resp := &types.MsgIBCSendResponse{Sequence: seq}
 	val, err := resp.Marshal()
 	if err != nil {
-		return nil, nil, errorsmod.Wrap(err, "failed to marshal IBC send response")
+		return nil, nil, newHandlerError(errorsmod.Wrap(err, "failed to marshal IBC send response"), other)
 	}
 
 	return nil, [][]byte{val}, nil
@@ -195,33 +220,33 @@ func (h IBCRawPacketHandler) DispatchMsg(ctx sdk.Context, _ sdk.AccAddress, cont
 var _ Messenger = MessageHandlerFunc(nil)
 
 // MessageHandlerFunc is a helper to construct a function based message handler.
-type MessageHandlerFunc func(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err error)
+type MessageHandlerFunc func(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err SourcedError)
 
 // DispatchMsg delegates dispatching of provided message into the MessageHandlerFunc.
-func (m MessageHandlerFunc) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err error) {
+func (m MessageHandlerFunc) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, contractIBCPortID string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err SourcedError) {
 	return m(ctx, contractAddr, contractIBCPortID, msg)
 }
 
 // NewBurnCoinMessageHandler handles wasmvm.BurnMsg messages
 func NewBurnCoinMessageHandler(burner types.Burner) MessageHandlerFunc {
-	return func(ctx sdk.Context, contractAddr sdk.AccAddress, _ string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err error) {
+	return func(ctx sdk.Context, contractAddr sdk.AccAddress, _ string, msg wasmvmtypes.CosmosMsg) (events []sdk.Event, data [][]byte, err SourcedError) {
 		if msg.Bank != nil && msg.Bank.Burn != nil {
 			coins, err := ConvertWasmCoinsToSdkCoins(msg.Bank.Burn.Amount)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, newHandlerError(err, other)
 			}
 			if coins.IsZero() {
-				return nil, nil, types.ErrEmpty.Wrap("amount")
+				return nil, nil, newHandlerError(types.ErrEmpty.Wrap("amount"), other)
 			}
 			if err := burner.SendCoinsFromAccountToModule(ctx, contractAddr, types.ModuleName, coins); err != nil {
-				return nil, nil, errorsmod.Wrap(err, "transfer to module")
+				return nil, nil, newHandlerError(errorsmod.Wrap(err, "transfer to module"), other)
 			}
 			if err := burner.BurnCoins(ctx, types.ModuleName, coins); err != nil {
-				return nil, nil, errorsmod.Wrap(err, "burn coins")
+				return nil, nil, newHandlerError(errorsmod.Wrap(err, "burn coins"), other)
 			}
 			moduleLogger(ctx).Info("Burned", "amount", coins)
 			return nil, nil, nil
 		}
-		return nil, nil, types.ErrUnknownMsg
+		return nil, nil, newHandlerError(types.ErrUnknownMsg, other)
 	}
 }
