@@ -54,16 +54,22 @@ func (q QueryHandler) Query(request wasmvmtypes.QueryRequest, gasLimit uint64) (
 		q.Ctx.GasMeter().ConsumeGas(subCtx.GasMeter().GasConsumed(), "contract sub-query")
 	}()
 
-	res, err := q.Plugins.HandleQuery(subCtx, q.Caller, request)
-	if err == nil {
+	res, rawErr := q.Plugins.HandleQuery(subCtx, q.Caller, request)
+	if rawErr == nil {
 		// short-circuit, the rest is dealing with handling existing errors
 		return res, nil
+	}
+	var err HandlerError
+	if request.Wasm != nil {
+		err = newDispatchError(rawErr, Contract)
+	} else {
+		err = newDispatchError(rawErr, Other)
 	}
 
 	// special mappings to wasmvm system error (which are not redacted)
 	var wasmvmErr types.WasmVMErrorable
 	if ok := errors.As(err, &wasmvmErr); ok {
-		err = wasmvmErr.ToWasmVMError()
+		err.Err = wasmvmErr.ToWasmVMError()
 	}
 
 	// Issue #759 - we don't return error string for worries of non-determinism
